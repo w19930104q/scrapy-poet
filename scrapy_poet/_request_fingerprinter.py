@@ -4,10 +4,9 @@ import hashlib
 import json
 from functools import cached_property
 from logging import getLogger
-from typing import TYPE_CHECKING, Annotated, get_args, get_origin
+from typing import TYPE_CHECKING
 from weakref import WeakKeyDictionary
 
-from andi import CustomBuilder
 from scrapy.settings.default_settings import REQUEST_FINGERPRINTER_CLASS
 from scrapy.utils.misc import build_from_crawler, load_object
 from scrapy.utils.request import RequestFingerprinter  # noqa: F401
@@ -20,10 +19,10 @@ from web_poet import (
     RequestUrl,
     Stats,
 )
-from web_poet.utils import get_fq_class_name
 
 from scrapy_poet import InjectionMiddleware
 from scrapy_poet.injection import get_callback
+from scrapy_poet.utils import _serialize_dep
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -36,15 +35,6 @@ if TYPE_CHECKING:
 
 
 logger = getLogger(__name__)
-
-
-def _serialize_dep(cls: Any) -> str:
-    if isinstance(cls, CustomBuilder):
-        cls = cls.result_class_or_fn
-    elif get_origin(cls) is Annotated:
-        annotated, *annotations = get_args(cls)
-        return f"{_serialize_dep(annotated)}{annotations!r}"
-    return get_fq_class_name(cls)
 
 
 class ScrapyPoetRequestFingerprinter:

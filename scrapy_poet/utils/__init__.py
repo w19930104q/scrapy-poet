@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 import inspect
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ParamSpec
+from typing import TYPE_CHECKING, Annotated, Any, ParamSpec, get_args, get_origin
 from warnings import warn
 
+from andi import CustomBuilder
 from packaging.version import Version
 from scrapy import __version__ as SCRAPY_VERSION
 from scrapy.downloadermiddlewares.retry import get_retry_request
@@ -23,6 +24,7 @@ from web_poet import (
     consume_modules,
     default_registry,
 )
+from web_poet.utils import get_fq_class_name
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -32,6 +34,17 @@ if TYPE_CHECKING:
     from web_poet.exceptions import Retry
 
 _P = ParamSpec("_P")
+
+
+def _serialize_dep(cls: Any) -> str:
+    """Return a string that uniquely identifies a dependency type, including
+    any :data:`typing.Annotated` metadata."""
+    if isinstance(cls, CustomBuilder):
+        cls = cls.result_class_or_fn
+    elif get_origin(cls) is Annotated:
+        annotated, *annotations = get_args(cls)
+        return f"{_serialize_dep(annotated)}{annotations!r}"
+    return get_fq_class_name(cls)
 
 
 def get_scrapy_data_path(createdir: bool = True, default_dir: str = ".scrapy") -> str:

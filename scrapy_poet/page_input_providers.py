@@ -115,10 +115,23 @@ class PageObjectInputProvider:
     this provider provides. Alternatively, it can be a function with type
     ``Callable[[Callable], bool]`` that returns ``True`` if and only if the
     given type, which must be callable, is provided by this provider.
+
+    The **merge_concurrent_calls** class attribute is ``False`` by default.
+    Set it to ``True`` in an asynchronous provider to allow merging
+    concurrent calls with identical inputs into a single call, so that
+    overlapping calls only execute the provider once and share its result.
+    Calls are only merged when they happen within the same crawler and have
+    the same request fingerprint, the same set of types to provide
+    (including :data:`typing.Annotated` metadata) and the same
+    JSON-serializable ``page_params``. Only enable this if your provider
+    guarantees that calls with the same inputs return equivalent results
+    that can be safely shared, as read-only objects, between all the merged
+    callers. See :ref:`provider-call-merging` for more details.
     """
 
     provided_classes: set[Any] | frozenset[Any] | Callable[[Any], bool]
     name: ClassVar[str] = ""  # It must be a unique name. Used by the cache mechanism
+    merge_concurrent_calls: ClassVar[bool] = False
 
     def is_provided(self, type_: Any) -> bool:
         """

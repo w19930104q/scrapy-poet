@@ -2,6 +2,13 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+* Asynchronous providers can now opt into merging of concurrent calls with
+  identical inputs by setting the ``merge_concurrent_calls`` class attribute
+  to ``True``. See :ref:`provider-call-merging`.
+
 0.28.0 (2026-11-06)
 -------------------
 

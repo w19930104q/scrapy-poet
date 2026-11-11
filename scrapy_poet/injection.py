@@ -1,5 +1,7 @@
+import asyncio
 import functools
 import inspect
+import json
 import logging
 import pprint
 import warnings
@@ -10,7 +12,7 @@ from weakref import WeakKeyDictionary
 
 import andi
 from andi.typeutils import issubclass_safe, strip_annotated
-from scrapy import Request, Spider
+from scrapy import Request, Spider, signals
 from scrapy.crawler import Crawler
 from scrapy.http import Response
 from scrapy.settings import Settings
@@ -32,13 +34,23 @@ from scrapy_poet.injection_errors import (
 )
 from scrapy_poet.page_input_providers import PageObjectInputProvider
 
-from .utils import create_registry_instance, get_scrapy_data_path
+from .utils import _serialize_dep, create_registry_instance, get_scrapy_data_path
 
 logger = logging.getLogger(__name__)
 
 
 class _UNDEFINED:
     pass
+
+
+class _InFlightProviderCall:
+    """Tracks an in-flight merged provider call and its waiters."""
+
+    __slots__ = ("task", "waiters")
+
+    def __init__(self, task: asyncio.Task[Any]) -> None:
+        self.task = task
+        self.waiters = 0
 
 
 class DynamicDeps(dict[Any, Any]):
@@ -67,6 +79,15 @@ class Injector:
         self.registry = registry or RulesRegistry()
         self.load_providers(default_providers)
         self.init_cache()
+        # In-flight merged provider calls, see _merged_provider_call(). Kept
+        # per injector, and hence per crawler, so that calls from different
+        # crawlers are never merged.
+        self._in_flight_provider_calls: dict[
+            tuple[Any, ...], _InFlightProviderCall
+        ] = {}
+        self.crawler.signals.connect(
+            self._release_in_flight_provider_calls, signal=signals.spider_closed
+        )
 
     def load_providers(
         self, default_providers: Mapping[Any, Any] | None = None
@@ -297,6 +318,111 @@ class Injector:
 
         return instances
 
+    def _release_in_flight_provider_calls(self) -> None:
+        """Cancel all in-flight merged provider calls and forget about them.
+
+        Connected to the ``spider_closed`` signal, so that stopping the crawl
+        releases the in-flight state.
+        """
+        in_flight = list(self._in_flight_provider_calls.values())
+        self._in_flight_provider_calls.clear()
+        for call in in_flight:
+            call.task.cancel()
+
+    @staticmethod
+    def _provider_merge_key(
+        provider: PageObjectInputProvider,
+        request: Request,
+        provided_classes: set[Any],
+    ) -> tuple[Any, ...] | None:
+        """Return a key that identifies provider calls that can be merged, or
+        ``None`` if the call inputs cannot be stably encoded and hence the
+        call must not be merged.
+
+        The key accounts for the provider itself, the request fingerprint,
+        the set of types to provide (including :data:`typing.Annotated`
+        metadata) and the JSON-serializable ``page_params``, regardless of
+        type or dict key ordering.
+        """
+        try:
+            serialized_page_params = json.dumps(
+                request.meta.get("page_params", {}), sort_keys=True
+            )
+        except (TypeError, ValueError):
+            return None
+        return (
+            # Providers live as long as their injector, so their id() is a
+            # safe identifier, usable even for unhashable provider classes.
+            id(provider),
+            # This one should take `web_poet.HttpRequest` but `scrapy.Request`
+            # works as well
+            # TODO: add `scrapy.Request` type in request_fingerprint() annotations
+            request_fingerprint(request),  # type: ignore[arg-type]
+            tuple(sorted(_serialize_dep(cls) for cls in provided_classes)),
+            serialized_page_params,
+        )
+
+    @staticmethod
+    async def _call_provider(
+        provider: Any,
+        provided_classes: set[Any],
+        kwargs: dict[str, Any],
+    ) -> Any:
+        objs = provider(set(provided_classes), **kwargs)
+        if inspect.isawaitable(objs):
+            objs = await objs
+        return objs
+
+    async def _merged_provider_call(
+        self,
+        merge_key: tuple[Any, ...],
+        provider: PageObjectInputProvider,
+        provided_classes: set[Any],
+        kwargs: dict[str, Any],
+    ) -> Any:
+        """Invoke the provider, merging the call with concurrent calls that
+        have the same merge key: only the first one is really executed and
+        the rest wait for its result.
+
+        Only in-flight calls are merged: results are not cached, so calls
+        made after the in-flight one finishes, including after a failure, are
+        executed again. Cancelling one of the waiting calls does not affect
+        the others; if all of them are cancelled, the in-flight call is
+        cancelled and forgotten.
+        """
+        in_flight = self._in_flight_provider_calls.get(merge_key)
+        if in_flight is None:
+            task = asyncio.ensure_future(
+                self._call_provider(provider, provided_classes, kwargs)
+            )
+            in_flight = _InFlightProviderCall(task)
+            self._in_flight_provider_calls[merge_key] = in_flight
+
+            def _on_done(_task: asyncio.Task[Any]) -> None:
+                if self._in_flight_provider_calls.get(merge_key) is in_flight:
+                    del self._in_flight_provider_calls[merge_key]
+                if not _task.cancelled():
+                    # Retrieve the exception, if any, so that it is not
+                    # reported as never retrieved when no waiter is left.
+                    _task.exception()
+
+            task.add_done_callback(_on_done)
+        else:
+            assert self.crawler.stats
+            self.crawler.stats.inc_value("poet/providers/merged_calls")
+        in_flight.waiters += 1
+        try:
+            # Shield the shared task so that cancelling a single waiter does
+            # not cancel the call for the remaining ones.
+            return await asyncio.shield(in_flight.task)
+        finally:
+            in_flight.waiters -= 1
+            if in_flight.waiters == 0 and not in_flight.task.done():
+                # All waiters were cancelled, nobody needs the result anymore.
+                in_flight.task.cancel()
+                if self._in_flight_provider_calls.get(merge_key) is in_flight:
+                    del self._in_flight_provider_calls[merge_key]
+
     async def build_instances_from_providers(
         self,
         request: Request,
@@ -358,9 +484,19 @@ class Injector:
                 ).final_kwargs(scrapy_provided_dependencies)
                 try:
                     # Invoke the provider to get the data
-                    objs = provider(set(provided_classes), **kwargs)
-                    if inspect.isawaitable(objs):
-                        objs = await objs
+                    merge_key = None
+                    if getattr(provider, "merge_concurrent_calls", False):
+                        merge_key = self._provider_merge_key(
+                            provider, request, provided_classes
+                        )
+                    if merge_key is not None:
+                        objs = await self._merged_provider_call(
+                            merge_key, provider, provided_classes, kwargs
+                        )
+                    else:
+                        objs = await self._call_provider(
+                            provider, provided_classes, kwargs
+                        )
 
                 except Exception as e:
                     if self.cache and self.caching_errors:

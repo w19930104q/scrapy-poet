@@ -139,6 +139,61 @@ Database queries, API Calls, AWS S3 files, etc)`.
    providers. This is turned on by default and the instances are stored in memory.
 
 
+.. _provider-call-merging:
+
+Merging concurrent calls
+========================
+
+Asynchronous providers (those whose ``__call__`` is ``async`` or otherwise
+returns an awaitable) can opt into merging of concurrent calls by setting the
+``merge_concurrent_calls`` class attribute to ``True``:
+
+.. code-block:: python
+
+    class MyProvider(PageObjectInputProvider):
+        provided_classes = {MyData}
+        merge_concurrent_calls = True
+
+        async def __call__(self, to_provide, request: Request):
+            ...
+
+When enabled, overlapping calls that happen within the same crawler and have
+identical inputs are merged into one: only the first call really executes the
+provider, and the remaining ones wait for and share its result. Two calls are
+considered identical when all of the following match, regardless of type or
+dict key ordering:
+
+- the fingerprint of the request being processed,
+- the set of types to provide, including :ref:`Annotated metadata <annotated>`,
+- the ``page_params`` of the request, serialized as JSON.
+
+If the ``page_params`` of a request cannot be serialized as JSON, calls for
+that request are never merged.
+
+Only enable this feature if your provider guarantees that calls with
+identical inputs return equivalent results, and that those results can be
+safely shared, as read-only objects, between all the merged callers, since
+all of them receive the same instances.
+
+The merging semantics are:
+
+- Only **in-flight** calls are merged. Results are not cached beyond the
+  lifetime of the in-flight call, so later calls are executed again. This is
+  unrelated to the persistent cache enabled by :setting:`SCRAPY_POET_CACHE`,
+  which keeps working as usual and can be combined with call merging.
+- Errors are not cached either: all waiters of a failed call get the
+  exception, and subsequent calls execute the provider again.
+- Cancelling one of the waiting calls (e.g. because its request is being
+  dropped) does not affect the remaining waiters. If all waiters are
+  cancelled, or the crawl stops, the in-flight call is cancelled and its
+  state is released.
+- Calls from different crawlers are never merged, as the in-flight state is
+  kept per crawler.
+
+The number of calls that were merged into an in-flight one is tracked in the
+``poet/providers/merged_calls`` :ref:`stat <stats>`.
+
+
 Configuring providers
 =====================
 

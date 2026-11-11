@@ -139,6 +139,64 @@ Database queries, API Calls, AWS S3 files, etc)`.
    providers. This is turned on by default and the instances are stored in memory.
 
 
+.. _merging-concurrent-calls:
+
+Merging concurrent provider calls
+=================================
+
+Asynchronous providers often fetch data from remote services, and several
+concurrent requests may need the exact same data at the same time (e.g. many
+pages asking an API for the same shared information). Providers can opt in to
+**merging of concurrent in-flight calls** by setting the
+``merge_concurrent_calls`` class attribute to ``True``:
+
+.. code-block:: python
+
+    class MyApiProvider(PageObjectInputProvider):
+        provided_classes = {MyApiData}
+        merge_concurrent_calls = True
+
+        async def __call__(self, to_provide: Set[Callable]):
+            data = await fetch_from_api(...)
+            return [MyApiData(data)]
+
+When enabled, overlapping calls made within the same crawler that ask for the
+same data are executed only once, and every caller gets the shared result.
+Two calls are considered identical when all of the following match:
+
+- the **request fingerprint** (URL, method, headers and body),
+- the **set of types to provide**, including any :data:`typing.Annotated`
+  metadata (the order of types is irrelevant),
+- the JSON encoding of ``request.meta["page_params"]`` (the order of
+  dictionary keys is irrelevant).
+
+If the types or the ``page_params`` cannot be stably encoded (e.g.
+``page_params`` contains values that are not JSON-serializable), the call is
+simply not merged and runs on its own.
+
+Only enable this for providers that **promise** that calls with the same key
+return equivalent results and that those results can be safely **shared as
+read-only objects** between the merged callers.
+
+The exact semantics are:
+
+- Only **in-flight** work is merged. Nothing is cached: once a call finishes,
+  a later identical call invokes the provider again. This is independent
+  from, and compatible with, the persistent provider cache
+  (``SCRAPY_POET_CACHE``), which keeps working as before.
+- Errors are not cached either: all current callers see the exception, and a
+  later call retries the provider.
+- Cancelling one caller does not affect the others. If all callers are
+  cancelled, or the crawl stops, the in-flight work is cancelled and its
+  state is released.
+- Merging never crosses crawler boundaries: each crawler runs its own calls.
+- Injection :ref:`stats <stats>` (``poet/injector/…``) keep their per-request
+  semantics, whether calls are merged or not.
+
+Merging relies on the :ref:`asyncio reactor <scrapy:install-asyncio>`; with
+any other reactor calls are simply not merged.
+
+
 Configuring providers
 =====================
 

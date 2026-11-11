@@ -115,10 +115,20 @@ class PageObjectInputProvider:
     this provider provides. Alternatively, it can be a function with type
     ``Callable[[Callable], bool]`` that returns ``True`` if and only if the
     given type, which must be callable, is provided by this provider.
+
+    The **merge_concurrent_calls** class attribute is ``False`` by default.
+    Set it to ``True`` to let scrapy-poet merge concurrent in-flight calls
+    of this provider that ask for the same data (same request fingerprint,
+    same set of types to provide and same JSON-encodable ``page_params``)
+    into a single execution, within the same crawler. Only enable it if the
+    provider guarantees that such calls return equivalent results that the
+    merged callers can safely share as read-only objects. See
+    :ref:`merging-concurrent-calls` for details.
     """
 
     provided_classes: set[Any] | frozenset[Any] | Callable[[Any], bool]
     name: ClassVar[str] = ""  # It must be a unique name. Used by the cache mechanism
+    merge_concurrent_calls: ClassVar[bool] = False
 
     def is_provided(self, type_: Any) -> bool:
         """

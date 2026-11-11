@@ -2,6 +2,16 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+* Added opt-in merging of concurrent in-flight provider calls: providers that
+  set ``merge_concurrent_calls = True`` get identical concurrent calls (same
+  request fingerprint, same provided type set and same ``page_params``,
+  within the same crawler) executed only once, with the result shared by all
+  callers. Only in-flight work is merged; results and errors are never
+  cached by this mechanism. See :ref:`merging-concurrent-calls`.
+
 0.28.0 (2026-11-06)
 -------------------
 

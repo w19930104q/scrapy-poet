@@ -1,16 +1,17 @@
 import functools
 import inspect
+import json
 import logging
 import pprint
 import warnings
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Hashable, Iterable, Mapping
 from pathlib import Path
 from typing import Any, cast, get_type_hints
 from weakref import WeakKeyDictionary
 
 import andi
 from andi.typeutils import issubclass_safe, strip_annotated
-from scrapy import Request, Spider
+from scrapy import Request, Spider, signals
 from scrapy.crawler import Crawler
 from scrapy.http import Response
 from scrapy.settings import Settings
@@ -24,6 +25,7 @@ from web_poet.pages import ItemPage, is_injectable
 from web_poet.serialization.api import deserialize_leaf, load_class, serialize
 from web_poet.utils import get_fq_class_name
 
+from scrapy_poet._inflight import InflightCallMerger
 from scrapy_poet.api import _CALLBACK_FOR_MARKER, DummyResponse
 from scrapy_poet.cache import SerializedDataCache
 from scrapy_poet.injection_errors import (
@@ -67,6 +69,17 @@ class Injector:
         self.registry = registry or RulesRegistry()
         self.load_providers(default_providers)
         self.init_cache()
+        # Merges concurrent identical in-flight calls of providers that opted
+        # in with ``merge_concurrent_calls = True``. It is per-Injector, hence
+        # per-crawler: calls from different crawlers are never merged.
+        self.inflight_call_merger = InflightCallMerger()
+        self.crawler.signals.connect(
+            self._release_inflight_calls, signal=signals.spider_closed
+        )
+
+    def _release_inflight_calls(self, spider: Spider | None = None) -> None:
+        """Cancel any in-flight merged provider calls when the crawl stops."""
+        self.inflight_call_merger.discard_all()
 
     def load_providers(
         self, default_providers: Mapping[Any, Any] | None = None
@@ -358,9 +371,9 @@ class Injector:
                 ).final_kwargs(scrapy_provided_dependencies)
                 try:
                     # Invoke the provider to get the data
-                    objs = provider(set(provided_classes), **kwargs)
-                    if inspect.isawaitable(objs):
-                        objs = await objs
+                    objs = await self._invoke_provider(
+                        provider, request, provided_classes, kwargs
+                    )
 
                 except Exception as e:
                     if self.cache and self.caching_errors:
@@ -402,6 +415,64 @@ class Injector:
                 self.crawler.stats.inc_value("poet/cache/firsthand")
 
         return instances
+
+    async def _invoke_provider(
+        self,
+        provider: PageObjectInputProvider,
+        request: Request,
+        provided_classes: set[Any],
+        kwargs: dict[str, Any],
+    ) -> Any:
+        """Invoke the provider, merging the call with identical in-flight
+        calls if the provider opted in with ``merge_concurrent_calls``."""
+
+        async def invoke() -> Any:
+            objs = provider(set(provided_classes), **kwargs)  # type: ignore[operator]
+            if inspect.isawaitable(objs):
+                objs = await objs
+            return objs
+
+        if not getattr(provider, "merge_concurrent_calls", False):
+            return await invoke()
+        key = self._provider_merge_key(provider, request, provided_classes)
+        if key is None:
+            # The call cannot be stably identified, so it is not merged.
+            return await invoke()
+        return await self.inflight_call_merger.merge(key, invoke)
+
+    @staticmethod
+    def _provider_merge_key(
+        provider: PageObjectInputProvider,
+        request: Request,
+        provided_classes: set[Any],
+    ) -> Hashable | None:
+        """Return a key identifying the provider call for merging purposes,
+        or ``None`` if the call cannot be stably identified and hence must
+        not be merged.
+
+        The key combines the provider type, the request fingerprint, the set
+        of types to provide (including any ``Annotated`` metadata) and the
+        JSON-encoded ``page_params`` request meta. Both the type set and the
+        ``page_params`` dictionary are order-insensitive.
+        """
+        try:
+            types_key = frozenset(provided_classes)
+        except TypeError:
+            # Some type (e.g. Annotated metadata) is not hashable.
+            return None
+        try:
+            page_params_key = json.dumps(
+                request.meta.get("page_params", {}), sort_keys=True
+            )
+        except (TypeError, ValueError):
+            # page_params is not JSON-encodable.
+            return None
+        return (
+            type(provider),
+            request_fingerprint(request),  # type: ignore[arg-type]
+            types_key,
+            page_params_key,
+        )
 
     async def build_callback_dependencies(
         self, request: Request, response: Response
